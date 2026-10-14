@@ -1,3 +1,4 @@
+import re
 """
 PHC MSDS Category I Hospital — Automated Continuous Quality Monitoring (CQM) Dashboard
 Universal Multi-Hospital Edition (Camden Health System HIMS, Oracle/SQL Server HIS,
@@ -1290,24 +1291,122 @@ elif page.startswith("7."):
 
         if uploaded_csv is not None:
             df_up = pd.read_csv(uploaded_csv)
+            st.markdown(f"**Preview of Uploaded Dataset ({len(df_up):,} rows × {len(df_up.columns)} columns):**")
             st.dataframe(df_up.head(10), use_container_width=True)
             cols = list(df_up.columns)
-            m_c1, m_c2, m_c3 = st.columns(3)
-            col_ind = m_c1.selectbox("Map Indicator ID Column", cols, index=0)
-            col_num = m_c2.selectbox("Map Numerator Column", cols, index=min(1, len(cols) - 1))
-            col_den = m_c3.selectbox("Map Denominator Column", cols, index=min(2, len(cols) - 1))
-            if st.button("Import Mapped CSV Rows"):
-                imported_count = 0
-                for _, r in df_up.iterrows():
-                    iid = str(r[col_ind]).strip()
-                    if iid in st.session_state.telemetry:
-                        st.session_state.telemetry[iid]["numerator"] = float(r[col_num])
-                        st.session_state.telemetry[iid]["denominator"] = float(r[col_den])
-                        st.session_state.telemetry[iid]["hours_since_last_pull"] = 0.1
-                        imported_count += 1
-                log_audit_event(f"User ({active_role})", active_role, "CUSTOM_CSV_IMPORT", f"{imported_count} KPIs", "Imported custom mapped CSV.")
-                st.success(f"Successfully imported and re-scored {imported_count} indicators!")
-                st.rerun()
+            csv_mode = st.radio(
+                "Select Your CSV Dataset Structure:",
+                [
+                    "Mode A: Aggregated KPI Summary CSV (Each row is an indicator with Numerator & Denominator)",
+                    "Mode B: Raw Hospital Record/Order CSV (Each row is a patient, lab test, scan, or chart)",
+                ],
+                horizontal=False,
+            )
+
+            if csv_mode.startswith("Mode A"):
+                m_c1, m_c2, m_c3 = st.columns(3)
+                col_ind = m_c1.selectbox("Map Indicator ID / Number Column", cols, index=0)
+                col_num = m_c2.selectbox("Map Numerator Column", cols, index=min(1, len(cols) - 1))
+                col_den = m_c3.selectbox("Map Denominator Column", cols, index=min(2, len(cols) - 1))
+                opt_cols = ["(None / Keep Default)"] + cols
+                e_c1, e_c2 = st.columns(2)
+                col_em_n = e_c1.selectbox("Optional: Emergency Numerator Column", opt_cols, index=0)
+                col_em_d = e_c2.selectbox("Optional: Emergency Denominator Column", opt_cols, index=0)
+
+                if st.button("🚀 Import & Re-Score Mapped KPI Rows", type="primary"):
+                    ind_lookup = {}
+                    for k_cfg in config["indicators"]:
+                        ind_lookup[k_cfg["id"].upper()] = k_cfg["id"]
+                        ind_lookup[str(k_cfg["indicator_number"])] = k_cfg["id"]
+                        ind_lookup[f"IND-{k_cfg['indicator_number']}"] = k_cfg["id"]
+                        ind_lookup[f"IND.{k_cfg['indicator_number']}"] = k_cfg["id"]
+                        ind_lookup[k_cfg["code"].upper()] = k_cfg["id"]
+                        ind_lookup[k_cfg["short_name"].upper()] = k_cfg["id"]
+
+                    imported_count = 0
+                    for _, r in df_up.iterrows():
+                        raw_key = str(r[col_ind]).strip().upper()
+                        digits = re.sub(r"[^0-9]", "", raw_key)
+                        iid = ind_lookup.get(raw_key) or (ind_lookup.get(digits) if digits else None)
+                        if iid and iid in st.session_state.telemetry:
+                            t = st.session_state.telemetry[iid]
+                            t["numerator"] = float(r[col_num])
+                            t["denominator"] = max(1.0, float(r[col_den]))
+                            t["hours_since_last_pull"] = 0.05
+                            if col_em_n != "(None / Keep Default)" and col_em_d != "(None / Keep Default)":
+                                if pd.notna(r.get(col_em_n)) and pd.notna(r.get(col_em_d)):
+                                    t["emergency_num"] = float(r[col_em_n])
+                                    t["emergency_den"] = max(1.0, float(r[col_em_d]))
+                                    t["routine_num"] = max(0.0, t["numerator"] - t["emergency_num"])
+                                    t["routine_den"] = max(1.0, t["denominator"] - t["emergency_den"])
+                            elif t.get("emergency_den"):
+                                t["routine_num"] = max(0.0, t["numerator"] - float(t.get("emergency_num") or 0))
+                                t["routine_den"] = max(1.0, t["denominator"] - float(t.get("emergency_den") or 0))
+                            ind_cfg = next(i for i in config["indicators"] if i["id"] == iid)
+                            ev = evaluate_kpi_deterministic(
+                                ind_cfg, t["numerator"], t["denominator"],
+                                t.get("emergency_num"), t.get("emergency_den"),
+                                t.get("routine_num"), t.get("routine_den"), 0.05
+                            )
+                            t["history"][-1] = ev.computed_value
+                            imported_count += 1
+                    log_audit_event(f"User ({active_role})", active_role, "CUSTOM_CSV_IMPORT", f"{imported_count} KPIs", "Imported custom mapped KPI summary CSV.")
+                    st.success(f"Successfully imported and re-scored {imported_count} indicators! Go to View 1, 2, or 3 to inspect.")
+                    st.rerun()
+            else:
+                r_c1, r_c2, r_c3 = st.columns(3)
+                target_kpi_label = r_c1.selectbox(
+                    "1. Target PHC Indicator for this Dataset",
+                    [f"{k['id']} (Ind. {k['indicator_number']}) — {k['short_name']}" for k in kpis],
+                )
+                eval_col = r_c2.selectbox("2. Column to Evaluate (Pass/Fail, Defect, or TAT mins)", cols, index=0)
+                rule_op = r_c3.selectbox(
+                    "3. Condition that Counts as Numerator",
+                    [
+                        "Value == 1 / True / 'Yes' / 'Met' / 'Compliant'",
+                        "Numeric Value <= Threshold (e.g. TAT minutes <= 60)",
+                        "Numeric Value >= Threshold",
+                    ],
+                )
+                thresh_val = 60.0
+                if "Threshold" in rule_op:
+                    thresh_val = st.number_input("Numeric Threshold Value", value=60.0, step=5.0)
+
+                if st.button("🚀 Aggregate Raw Dataset & Update Indicator", type="primary"):
+                    iid = target_kpi_label.split(" ")[0]
+                    total_rows = len(df_up)
+                    series_col = df_up[eval_col]
+                    if rule_op.startswith("Value =="):
+                        met_mask = series_col.astype(str).str.strip().str.lower().isin(["1", "1.0", "true", "yes", "y", "met", "compliant", "pass", "passed"])
+                    elif "<=" in rule_op:
+                        met_mask = pd.to_numeric(series_col, errors="coerce") <= thresh_val
+                    else:
+                        met_mask = pd.to_numeric(series_col, errors="coerce") >= thresh_val
+
+                    num_count = float(met_mask.sum())
+                    den_count = float(max(1, total_rows))
+                    t = st.session_state.telemetry[iid]
+                    t["numerator"] = num_count
+                    t["denominator"] = den_count
+                    t["hours_since_last_pull"] = 0.05
+                    if t.get("emergency_den"):
+                        t["emergency_num"] = num_count
+                        t["emergency_den"] = den_count
+                        t["routine_num"] = num_count
+                        t["routine_den"] = den_count
+                    ind_cfg = next(i for i in config["indicators"] if i["id"] == iid)
+                    ev = evaluate_kpi_deterministic(
+                        ind_cfg, t["numerator"], t["denominator"],
+                        t.get("emergency_num"), t.get("emergency_den"),
+                        t.get("routine_num"), t.get("routine_den"), 0.05
+                    )
+                    t["history"][-1] = ev.computed_value
+                    log_audit_event(
+                        f"User ({active_role})", active_role, "RAW_CSV_AGGREGATE", iid,
+                        f"Aggregated {total_rows:,} raw rows -> N={int(num_count):,}, D={int(den_count):,} ({ev.status})."
+                    )
+                    st.success(f"Aggregated {total_rows:,} rows for {iid}: N={int(num_count):,} / D={int(den_count):,} -> Status is now **{ev.status}**!")
+                    st.rerun()
 
     with tab_tally:
         st.subheader("📱 30-Second Ward Round Micro-Tally (For Non-Digitized Indicators)")
