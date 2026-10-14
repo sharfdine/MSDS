@@ -7,6 +7,7 @@ MySQL/Postgres, Smart CSV/Excel Column Mapper, and Ward Tablet Micro-Tally).
 import os
 import io
 import copy
+import math
 import datetime
 import streamlit as st
 import pandas as pd
@@ -746,28 +747,102 @@ def log_audit_event(actor: str, role: str, action: str, target: str, details: st
     )
 
 
+
+def safe_float(val, default: float = 0.0) -> float:
+    if val is None:
+        return default
+    try:
+        if isinstance(val, str):
+            cleaned = val.replace(",", "").replace("%", "").strip()
+            if not cleaned:
+                return default
+            fval = float(cleaned)
+        else:
+            fval = float(val)
+        if math.isnan(fval) or math.isinf(fval):
+            return default
+        return fval
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_opt_float(val):
+    if val is None:
+        return None
+    try:
+        if isinstance(val, str):
+            cleaned = val.replace(",", "").replace("%", "").strip()
+            if not cleaned:
+                return None
+            fval = float(cleaned)
+        else:
+            fval = float(val)
+        if math.isnan(fval) or math.isinf(fval):
+            return None
+        return fval
+    except (ValueError, TypeError):
+        return None
+
+
+def safe_int(val, default: int = 0) -> int:
+    return int(round(safe_float(val, float(default))))
+
+
 def evaluate_current_state():
     cfg = st.session_state.base_config
-    max_stale = float(cfg["scoring_engine_defaults"].get("missing_data_threshold_hours", 24.0))
+    max_stale = safe_float(cfg["scoring_engine_defaults"].get("missing_data_threshold_hours", 24.0), 24.0)
     kpi_rows = []
     alerts = []
 
     for ind in cfg["indicators"]:
         ind_id = ind["id"]
-        sim = st.session_state.telemetry[ind_id]
+        fallback = SIMULATED_TELEMETRY.get(ind_id, {"numerator": 0.0, "denominator": 1.0, "history": [100.0] * 12})
+        sim = st.session_state.telemetry.setdefault(ind_id, copy.deepcopy(fallback))
+
+        # Self-heal any NaN / None / zero denominator in session_state so engine.py never crashes
+        num_val = safe_float(sim.get("numerator"), safe_float(fallback.get("numerator"), 0.0))
+        den_val = safe_float(sim.get("denominator"), safe_float(fallback.get("denominator"), 1.0))
+        if den_val <= 0:
+            den_val = max(1.0, safe_float(fallback.get("denominator"), 1.0))
+        sim["numerator"] = num_val
+        sim["denominator"] = den_val
+
+        em_num = safe_opt_float(sim.get("emergency_num"))
+        em_den = safe_opt_float(sim.get("emergency_den"))
+        if em_den is not None and em_den <= 0:
+            em_den = None
+            em_num = None
+        rt_num = safe_opt_float(sim.get("routine_num"))
+        rt_den = safe_opt_float(sim.get("routine_den"))
+        if rt_den is not None and rt_den <= 0:
+            rt_den = None
+            rt_num = None
+
+        sim["emergency_num"] = em_num
+        sim["emergency_den"] = em_den
+        sim["routine_num"] = rt_num
+        sim["routine_den"] = rt_den
+
+        stale_h = safe_float(sim.get("hours_since_last_pull"), 1.0)
+        sim["hours_since_last_pull"] = stale_h
+
+        raw_hist = sim.get("history") or fallback.get("history") or [100.0] * 12
+        clean_hist = [safe_float(x, 0.0) for x in raw_hist]
+        sim["history"] = clean_hist
+
         eval_res = evaluate_kpi_deterministic(
             indicator_cfg=ind,
-            numerator=sim["numerator"],
-            denominator=sim["denominator"],
-            emergency_num=sim.get("emergency_num"),
-            emergency_den=sim.get("emergency_den"),
-            routine_num=sim.get("routine_num"),
-            routine_den=sim.get("routine_den"),
-            hours_since_last_pull=sim.get("hours_since_last_pull", 1.0),
+            numerator=num_val,
+            denominator=den_val,
+            emergency_num=em_num,
+            emergency_den=em_den,
+            routine_num=rt_num,
+            routine_den=rt_den,
+            hours_since_last_pull=stale_h,
             max_stale_hours=max_stale,
         )
         spc_res = compute_spc_metrics(
-            series=sim["history"],
+            series=clean_hist,
             direction=ind["direction"],
             unit=ind["unit"],
         )
@@ -777,14 +852,14 @@ def evaluate_current_state():
 
         kpi_rows.append({
             **ind,
-            "numerator": sim["numerator"],
-            "denominator": sim["denominator"],
-            "emergency_num": sim.get("emergency_num"),
-            "emergency_den": sim.get("emergency_den"),
-            "routine_num": sim.get("routine_num"),
-            "routine_den": sim.get("routine_den"),
-            "hours_since_last_pull": sim.get("hours_since_last_pull", 1.0),
-            "history": sim["history"],
+            "numerator": num_val,
+            "denominator": den_val,
+            "emergency_num": em_num,
+            "emergency_den": em_den,
+            "routine_num": rt_num,
+            "routine_den": rt_den,
+            "hours_since_last_pull": stale_h,
+            "history": clean_hist,
             "months": MONTH_LABELS,
             "eval": eval_res,
             "spc": spc_res,
@@ -1325,30 +1400,40 @@ elif page.startswith("7."):
 
                     imported_count = 0
                     for _, r in df_up.iterrows():
-                        raw_key = str(r[col_ind]).strip().upper()
+                        raw_key = str(r.get(col_ind, "")).strip().upper()
+                        if not raw_key or raw_key == "NAN":
+                            continue
                         digits = re.sub(r"[^0-9]", "", raw_key)
                         iid = ind_lookup.get(raw_key) or (ind_lookup.get(digits) if digits else None)
                         if iid and iid in st.session_state.telemetry:
+                            parsed_n = safe_opt_float(r.get(col_num))
+                            parsed_d = safe_opt_float(r.get(col_den)) if col_den != col_num else 100.0
+                            if parsed_n is None:
+                                continue
+                            if parsed_d is None or parsed_d <= 0:
+                                parsed_d = 100.0
                             t = st.session_state.telemetry[iid]
-                            t["numerator"] = float(r[col_num])
-                            t["denominator"] = max(1.0, float(r[col_den]))
+                            t["numerator"] = max(0.0, parsed_n)
+                            t["denominator"] = max(1.0, parsed_d)
                             t["hours_since_last_pull"] = 0.05
                             if col_em_n != "(None / Keep Default)" and col_em_d != "(None / Keep Default)":
-                                if pd.notna(r.get(col_em_n)) and pd.notna(r.get(col_em_d)):
-                                    t["emergency_num"] = float(r[col_em_n])
-                                    t["emergency_den"] = max(1.0, float(r[col_em_d]))
+                                em_n_val = safe_opt_float(r.get(col_em_n))
+                                em_d_val = safe_opt_float(r.get(col_em_d))
+                                if em_n_val is not None and em_d_val is not None and em_d_val > 0:
+                                    t["emergency_num"] = max(0.0, em_n_val)
+                                    t["emergency_den"] = max(1.0, em_d_val)
                                     t["routine_num"] = max(0.0, t["numerator"] - t["emergency_num"])
                                     t["routine_den"] = max(1.0, t["denominator"] - t["emergency_den"])
                             elif t.get("emergency_den"):
-                                t["routine_num"] = max(0.0, t["numerator"] - float(t.get("emergency_num") or 0))
-                                t["routine_den"] = max(1.0, t["denominator"] - float(t.get("emergency_den") or 0))
+                                t["routine_num"] = max(0.0, t["numerator"] - safe_float(t.get("emergency_num"), 0.0))
+                                t["routine_den"] = max(1.0, t["denominator"] - safe_float(t.get("emergency_den"), 0.0))
                             ind_cfg = next(i for i in config["indicators"] if i["id"] == iid)
                             ev = evaluate_kpi_deterministic(
                                 ind_cfg, t["numerator"], t["denominator"],
                                 t.get("emergency_num"), t.get("emergency_den"),
                                 t.get("routine_num"), t.get("routine_den"), 0.05
                             )
-                            t["history"][-1] = ev.computed_value
+                            t["history"][-1] = safe_float(ev.computed_value, 0.0)
                             imported_count += 1
                     log_audit_event(f"User ({active_role})", active_role, "CUSTOM_CSV_IMPORT", f"{imported_count} KPIs", "Imported custom mapped KPI summary CSV.")
                     st.success(f"Successfully imported and re-scored {imported_count} indicators! Go to View 1, 2, or 3 to inspect.")
